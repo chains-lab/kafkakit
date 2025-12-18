@@ -70,8 +70,8 @@ func (e OutboxEvent) IsNil() bool {
 
 func (b *Box) CreateOutboxEvent(
 	ctx context.Context,
-	message kafka.Message,
 	status string,
+	message kafka.Message,
 ) (OutboxEvent, error) {
 	key := message.Key
 	topic := message.Topic

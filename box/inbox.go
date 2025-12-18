@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	InboxEventStatusPending   = "pending"
-	InboxEventStatusProcessed = "processed"
-	InboxEventStatusFailed    = "failed"
+	InboxStatusPending   = "pending"
+	InboxStatusProcessed = "processed"
+	InboxStatusFailed    = "failed"
 )
 
 type InboxEvent struct {
@@ -70,8 +70,8 @@ func (e InboxEvent) IsNil() bool {
 
 func (b *Box) CreateInboxEvent(
 	ctx context.Context,
-	message kafka.Message,
 	status string,
+	message kafka.Message,
 ) (InboxEvent, error) {
 	key := message.Key
 	topic := message.Topic
@@ -123,10 +123,10 @@ func (b *Box) CreateInboxEvent(
 	}
 
 	switch status {
-	case InboxEventStatusPending:
+	case InboxStatusPending:
 		stmt.NextRetryAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 
-	case InboxEventStatusProcessed:
+	case InboxStatusProcessed:
 		stmt.ProcessedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 		stmt.Attempts = 1
 	}
