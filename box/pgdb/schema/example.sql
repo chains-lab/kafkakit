@@ -1,6 +1,6 @@
 CREATE TYPE outbox_event_status AS ENUM (
     'pending',
-    'processing'
+    'processing',
     'sent',
     'failed'
 );
@@ -24,7 +24,7 @@ CREATE TABLE outbox_events (
 
 CREATE TYPE inbox_event_status AS ENUM (
     'pending',
-    'processing'
+    'processing',
     'processed',
     'failed'
 );

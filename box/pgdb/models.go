@@ -17,9 +17,10 @@ import (
 type InboxEventStatus string
 
 const (
-	InboxEventStatusPending             InboxEventStatus = "pending"
-	InboxEventStatusProcessingprocessed InboxEventStatus = "processingprocessed"
-	InboxEventStatusFailed              InboxEventStatus = "failed"
+	InboxEventStatusPending    InboxEventStatus = "pending"
+	InboxEventStatusProcessing InboxEventStatus = "processing"
+	InboxEventStatusProcessed  InboxEventStatus = "processed"
+	InboxEventStatusFailed     InboxEventStatus = "failed"
 )
 
 func (e *InboxEventStatus) Scan(src interface{}) error {
@@ -60,9 +61,10 @@ func (ns NullInboxEventStatus) Value() (driver.Value, error) {
 type OutboxEventStatus string
 
 const (
-	OutboxEventStatusPending        OutboxEventStatus = "pending"
-	OutboxEventStatusProcessingsent OutboxEventStatus = "processingsent"
-	OutboxEventStatusFailed         OutboxEventStatus = "failed"
+	OutboxEventStatusPending    OutboxEventStatus = "pending"
+	OutboxEventStatusProcessing OutboxEventStatus = "processing"
+	OutboxEventStatusSent       OutboxEventStatus = "sent"
+	OutboxEventStatusFailed     OutboxEventStatus = "failed"
 )
 
 func (e *OutboxEventStatus) Scan(src interface{}) error {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/chains-lab/kafkakit/box/pgdb"
@@ -50,7 +51,7 @@ func (e InboxEvent) ToMessage() kafka.Message {
 			},
 			{
 				Key:   "event_version",
-				Value: []byte(string(e.Version)),
+				Value: []byte(strconv.FormatInt(int64(e.Version), 10)),
 			},
 			{
 				Key:   "producer",
