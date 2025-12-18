@@ -1,0 +1,61 @@
+-- name: CreateInboxEvent :one
+INSERT INTO inbox_events (
+    id,
+    topic,
+    key,
+    type,
+    version,
+    producer,
+    payload,
+    status,
+    attempts,
+    next_retry_at,
+    processed_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9,  $10, $11
+)
+RETURNING *;
+
+-- name: GetInboxEventByID :one
+SELECT *
+FROM inbox_events
+WHERE id = $1;
+
+-- name: GetPendingInboxEvents :many
+UPDATE inbox_events
+SET status = 'processing'
+WHERE id IN (
+    SELECT id
+    FROM inbox_events
+    WHERE status = 'pending'
+        AND (next_retry_at IS NULL OR next_retry_at <= now() AT TIME ZONE 'UTC')
+    ORDER BY created_at
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+
+-- name: MarkInboxEventsAsProcessed :many
+UPDATE inbox_events
+SET
+    status = 'processed',
+    processed_at = now() AT TIME ZONE 'UTC'
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;
+
+-- name: MarkInboxEventsAsFailed :many
+UPDATE inbox_events
+SET
+    status = 'failed',
+    nrxt_retry_at = NULL
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;
+
+-- name: DelayInboxEventsRetry :many
+UPDATE inbox_events
+SET
+    attempts = attempts + 1,
+    next_retry_at = sqlc.arg(next_retry_at)::timestamptz
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;

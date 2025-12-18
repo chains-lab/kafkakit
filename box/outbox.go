@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/chains-lab/kafkakit/box/pgdb"
 	"github.com/google/uuid"
+	"github.com/segmentio/kafka-go"
 )
 
 const (
@@ -17,105 +19,214 @@ const (
 	OutboxStatusFailed  = "failed"
 )
 
-func (r *Repository) CreateOutboxEvent(ctx context.Context, event contracts.Message) error {
-	payloadBytes, err := json.Marshal(event.Payload)
-	if err != nil {
-		return err
-	}
-
-	now := time.Now().UTC()
-
-	row := pgdb.OutboxEvent{
-		ID:           uuid.New(),
-		Topic:        event.Topic,
-		EventType:    event.EventType,
-		EventVersion: int(event.EventVersion),
-		Key:          event.Key,
-		Payload:      payloadBytes,
-
-		Status:      "pending",
-		Attempts:    0,
-		NextRetryAt: now,
-
-		CreatedAt: now,
-		SentAt:    nil,
-	}
-
-	return r.sql.outbox.Insert(ctx, row)
+type OutboxEvent struct {
+	ID          uuid.UUID
+	Topic       string
+	Key         string
+	Type        string
+	Version     int32
+	Producer    string
+	Payload     json.RawMessage
+	Status      string
+	Attempts    int32
+	CreatedAt   time.Time
+	NextRetryAt *time.Time
+	SentAt      *time.Time
 }
 
-func (r *Repository) GetPendingOutboxEvents(ctx context.Context, limit int32) ([]contracts.OutboxEvent, error) {
-	now := time.Now().UTC()
+func (e OutboxEvent) ToMessage() kafka.Message {
+	return kafka.Message{
+		Topic: e.Topic,
+		Key:   []byte(e.Key),
+		Value: e.Payload,
+		Headers: []kafka.Header{
+			{
+				Key:   "event_id",
+				Value: []byte(e.ID.String()),
+			},
+			{
+				Key:   "event_type",
+				Value: []byte(e.Type),
+			},
+			{
+				Key:   "event_version",
+				Value: []byte(string(e.Version)),
+			},
+			{
+				Key:   "producer",
+				Value: []byte(e.Producer),
+			},
+			{
+				Key:   "content_type",
+				Value: []byte("application/json"),
+			},
+		},
+	}
+}
 
-	rows, err := r.sql.outbox.New().
-		FilterStatus("pending").
-		FilterReadyToSend(now).
-		OrderByCreatedAtAsc().
-		Page(uint64(limit), 0).
-		Select(ctx)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return []contracts.OutboxEvent{}, nil
-	case err != nil:
-		return []contracts.OutboxEvent{}, err
+func (e OutboxEvent) IsNil() bool {
+	return e.ID == uuid.Nil
+}
+
+func (b *Box) CreateOutboxEvent(
+	ctx context.Context,
+	message kafka.Message,
+	status string,
+) (OutboxEvent, error) {
+	key := message.Key
+	topic := message.Topic
+	value := message.Value
+
+	headers := map[string][]byte{}
+	for _, h := range message.Headers {
+		headers[h.Key] = h.Value
 	}
 
-	events := make([]contracts.OutboxEvent, 0, len(rows))
-	for _, e := range rows {
-		events = append(events, contracts.OutboxEvent{
-			ID:           e.ID,
-			Topic:        e.Topic,
-			EventType:    e.EventType,
-			EventVersion: e.EventVersion,
-			Key:          e.Key,
-			Payload:      e.Payload,
-		})
+	eventIDByte, ok := headers["event_id"]
+	if !ok {
+		return OutboxEvent{}, errors.New("missing event_id header")
+	}
+	eventID, err := uuid.ParseBytes(eventIDByte)
+	if err != nil {
+		return OutboxEvent{}, errors.New("invalid event_id header")
+	}
+
+	eventType, ok := headers["event_type"]
+	if !ok {
+		return OutboxEvent{}, errors.New("missing event_type header")
+	}
+
+	eventVersionBytes, ok := headers["event_version"]
+	if !ok {
+		return OutboxEvent{}, errors.New("missing event_version header")
+	}
+
+	producer, ok := headers["producer"]
+	if !ok {
+		return OutboxEvent{}, errors.New("missing producer header")
+	}
+
+	var eventVersion int32
+	if err := json.Unmarshal(eventVersionBytes, &eventVersion); err != nil {
+		return OutboxEvent{}, errors.New("invalid event_version header")
+	}
+
+	stmt := pgdb.CreateOutboxEventParams{
+		ID:       eventID,
+		Topic:    topic,
+		Key:      string(key),
+		Type:     string(eventType),
+		Version:  eventVersion,
+		Producer: string(producer),
+		Payload:  value,
+		Status:   pgdb.OutboxEventStatus(status),
+	}
+
+	switch status {
+	case OutboxStatusPending:
+		stmt.NextRetryAt = sql.NullTime{Valid: true, Time: time.Now().UTC()}
+	case OutboxStatusSent:
+		stmt.SentAt = sql.NullTime{Valid: true, Time: time.Now().UTC()}
+		stmt.Attempts = 1
+	}
+
+	res, err := b.queries.CreateOutboxEvent(ctx, stmt)
+	if err != nil {
+		return OutboxEvent{}, fmt.Errorf("create outbox event: %w", err)
+	}
+
+	return pgdbOutboxEvent(res), nil
+}
+
+func (b *Box) GetOutboxEventByID(ctx context.Context, id uuid.UUID) (OutboxEvent, error) {
+	res, err := b.queries.GetOutboxEventByID(ctx, id)
+	if err != nil {
+		return OutboxEvent{}, fmt.Errorf("get outbox event by id: %w", err)
+	}
+
+	return pgdbOutboxEvent(res), nil
+}
+
+func (b *Box) GetPendingOutboxEvents(ctx context.Context, limit int32) ([]OutboxEvent, error) {
+	res, err := b.queries.GetPendingOutboxEvents(ctx, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get pending outbox events: %w", err)
+	}
+
+	events := make([]OutboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbOutboxEvent(e))
 	}
 
 	return events, nil
 }
 
-func (r *Repository) MarkOutboxEventsSent(ctx context.Context, ids []uuid.UUID) error {
-	if len(ids) == 0 {
-		return nil
+func (b *Box) MarkOutboxEventsSent(ctx context.Context, ids []uuid.UUID) ([]OutboxEvent, error) {
+	res, err := b.queries.MarkOutboxEventsAsSent(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("mark outbox events as sent: %w", err)
 	}
 
-	now := time.Now().UTC()
+	events := make([]OutboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbOutboxEvent(e))
+	}
 
-	return r.sql.outbox.Transaction(ctx, func(ctx context.Context) error {
-		for _, id := range ids {
-			_, err := r.sql.outbox.New().
-				FilterID(id).
-				UpdateStatus("sent").
-				UpdateSentAt(now).
-				Update(ctx)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return events, nil
 }
 
-func (r *Repository) DelayOutboxEvents(ctx context.Context, ids []uuid.UUID, delay time.Duration) error {
-	if len(ids) == 0 {
-		return nil
+func (b *Box) MarkOutboxEventsAsFailed(ctx context.Context, ids []uuid.UUID) ([]OutboxEvent, error) {
+	res, err := b.queries.MarkOutboxEventsAsFailed(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("mark outbox events as failed: %w", err)
 	}
 
-	next := time.Now().UTC().Add(delay)
+	events := make([]OutboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbOutboxEvent(e))
+	}
 
-	return r.sql.outbox.Transaction(ctx, func(ctx context.Context) error {
-		for _, id := range ids {
-			_, err := r.sql.outbox.New().
-				FilterID(id).
-				AddAttempts().
-				UpdateStatus("pending").
-				UpdateNextRetryAt(next).
-				Update(ctx)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+	return events, nil
+}
+
+func (b *Box) DelayOutboxEvents(ctx context.Context, ids []uuid.UUID, delay time.Duration) ([]OutboxEvent, error) {
+	res, err := b.queries.DelayOutboxEventsRetry(ctx, pgdb.DelayOutboxEventsRetryParams{
+		Ids:         ids,
+		NextRetryAt: time.Now().UTC().Add(delay),
 	})
+	if err != nil {
+		return nil, fmt.Errorf("delay outbox events retry: %w", err)
+	}
+
+	events := make([]OutboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbOutboxEvent(e))
+	}
+
+	return events, nil
+}
+
+func pgdbOutboxEvent(e pgdb.OutboxEvent) OutboxEvent {
+	res := OutboxEvent{
+		ID:        e.ID,
+		Topic:     e.Topic,
+		Key:       e.Key,
+		Type:      e.Type,
+		Version:   e.Version,
+		Producer:  e.Producer,
+		Payload:   e.Payload,
+		Status:    string(e.Status),
+		Attempts:  e.Attempts,
+		CreatedAt: e.CreatedAt,
+	}
+
+	if e.NextRetryAt.Valid {
+		res.NextRetryAt = &e.NextRetryAt.Time
+	}
+
+	if e.SentAt.Valid {
+		res.SentAt = &e.SentAt.Time
+	}
+
+	return res
 }

@@ -1,0 +1,61 @@
+-- name: CreateOutboxEvent :one
+INSERT INTO outbox_events (
+    id,
+    topic,
+    type,
+    version,
+    key,
+    producer,
+    payload,
+    status,
+    attempts,
+    next_retry_at,
+    sent_at
+) VALUES (
+    $1, $2, $3, $4, $5, $6,
+    $7, $8, $9,  $10, $11
+)
+RETURNING *;
+
+-- name: GetOutboxEventByID :one
+SELECT *
+FROM outbox_events
+WHERE id = $1;
+
+-- name: GetPendingOutboxEvents :many
+UPDATE outbox_events
+SET status = 'processing'
+WHERE id IN (
+    SELECT id
+    FROM outbox_events
+    WHERE status = 'pending'
+       AND next_retry_at <= now() AT TIME ZONE 'UTC'
+    ORDER BY created_at
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+
+-- name: MarkOutboxEventsAsSent :many
+UPDATE outbox_events
+SET
+    status = 'sent',
+    sent_at = now() AT TIME ZONE 'UTC'
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;
+
+-- name: MarkOutboxEventsAsFailed :many
+UPDATE outbox_events
+SET
+    status = 'failed',
+    next_retry_at = NULL
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;
+
+-- name: DelayOutboxEventsRetry :many
+UPDATE outbox_events
+SET
+    attempts = attempts + 1,
+    next_retry_at = sqlc.arg(next_retry_at)::timestamptz
+WHERE id = ANY(sqlc.arg(ids)::uuid[])
+RETURNING *;

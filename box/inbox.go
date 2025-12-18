@@ -5,11 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
-	"github.com/chains-lab/kafkakit"
 	"github.com/chains-lab/kafkakit/box/pgdb"
 	"github.com/google/uuid"
+	"github.com/segmentio/kafka-go"
 )
 
 const (
@@ -19,26 +20,47 @@ const (
 )
 
 type InboxEvent struct {
-	ID           uuid.UUID
-	Topic        string
-	EventType    string
-	EventVersion uint
-	Key          string
-	Payload      json.RawMessage
-	Status       string
-	Attempts     uint
-	CreatedAt    time.Time
-	NextRetryAt  *time.Time
-	ProcessedAt  *time.Time
+	ID          uuid.UUID
+	Topic       string
+	Key         string
+	Type        string
+	Version     int32
+	Producer    string
+	Payload     json.RawMessage
+	Status      string
+	Attempts    int32
+	CreatedAt   time.Time
+	NextRetryAt *time.Time
+	ProcessedAt *time.Time
 }
 
-func (e InboxEvent) ToMessage() kafkakit.Message {
-	return kafkakit.Message{
-		Topic:        e.Topic,
-		EventType:    e.EventType,
-		EventVersion: e.EventVersion,
-		Key:          e.Key,
-		Payload:      e.Payload,
+func (e InboxEvent) ToMessage() kafka.Message {
+	return kafka.Message{
+		Topic: e.Topic,
+		Key:   []byte(e.Key),
+		Value: e.Payload,
+		Headers: []kafka.Header{
+			{
+				Key:   "event_id",
+				Value: []byte(e.ID.String()),
+			},
+			{
+				Key:   "event_type",
+				Value: []byte(e.Type),
+			},
+			{
+				Key:   "event_version",
+				Value: []byte(string(e.Version)),
+			},
+			{
+				Key:   "producer",
+				Value: []byte(e.Producer),
+			},
+			{
+				Key:   "content_type",
+				Value: []byte("application/json"),
+			},
+		},
 	}
 }
 
@@ -46,35 +68,70 @@ func (e InboxEvent) IsNil() bool {
 	return e.ID == uuid.Nil
 }
 
-type CreateInboxEventParams struct {
-	Event   kafkakit.Message
-	Status  string
-	RetryAt time.Duration
-}
-
-func (r *Repository) CreateInboxEvent(
+func (b *Box) CreateInboxEvent(
 	ctx context.Context,
-	params CreateInboxEventParams,
+	message kafka.Message,
+	status string,
 ) (InboxEvent, error) {
-	stmt := pgdb.InboxEvent{
-		ID:           uuid.New(),
-		Topic:        params.Event.Topic,
-		EventType:    params.Event.EventType,
-		EventVersion: params.Event.EventVersion,
-		Key:          params.Event.Key,
-		Payload:      params.Event.Payload,
-		Status:       params.Status,
-		CreatedAt:    time.Now().UTC(),
+	key := message.Key
+	topic := message.Topic
+	value := message.Value
+
+	headers := map[string][]byte{}
+	for _, h := range message.Headers {
+		headers[h.Key] = h.Value
 	}
 
-	switch params.Status {
+	eventIDByte, ok := headers["event_id"]
+	if !ok {
+		return InboxEvent{}, errors.New("missing event_id header")
+	}
+	eventID, err := uuid.ParseBytes(eventIDByte)
+	if err != nil {
+		return InboxEvent{}, errors.New("invalid event_id header")
+	}
+
+	eventType, ok := headers["event_type"]
+	if !ok {
+		return InboxEvent{}, errors.New("missing event_type header")
+	}
+
+	eventVersionBytes, ok := headers["event_version"]
+	if !ok {
+		return InboxEvent{}, errors.New("missing event_version header")
+	}
+
+	producer, ok := headers["producer"]
+	if !ok {
+		return InboxEvent{}, errors.New("missing producer header")
+	}
+
+	var eventVersion int32
+	if err := json.Unmarshal(eventVersionBytes, &eventVersion); err != nil {
+		return InboxEvent{}, errors.New("invalid event_version header")
+	}
+
+	stmt := pgdb.CreateInboxEventParams{
+		ID:       eventID,
+		Topic:    topic,
+		Key:      string(key),
+		Type:     string(eventType),
+		Version:  eventVersion,
+		Producer: string(producer),
+		Payload:  value,
+		Status:   pgdb.InboxEventStatus(status),
+	}
+
+	switch status {
 	case InboxEventStatusPending:
 		stmt.NextRetryAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+
 	case InboxEventStatusProcessed:
 		stmt.ProcessedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		stmt.Attempts = 1
 	}
 
-	res, err := r.Inbox().Insert(ctx, stmt)
+	res, err := b.queries.CreateInboxEvent(ctx, stmt)
 	if err != nil {
 		return InboxEvent{}, err
 	}
@@ -82,11 +139,11 @@ func (r *Repository) CreateInboxEvent(
 	return pgdbInboxEvent(res), nil
 }
 
-func (r *Repository) GetInboxEvent(
+func (b *Box) GetInboxEventByID(
 	ctx context.Context,
 	id uuid.UUID,
 ) (InboxEvent, error) {
-	res, err := r.Inbox().FilterID(id).Get(ctx)
+	res, err := b.queries.GetInboxEventByID(ctx, id)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return InboxEvent{}, nil
@@ -97,86 +154,73 @@ func (r *Repository) GetInboxEvent(
 	return pgdbInboxEvent(res), nil
 }
 
-func (r *Repository) GetInboxEventByKey(
+func (b *Box) MarkInboxEventsAsProcessed(
 	ctx context.Context,
-	key string,
-	topic string,
-	eventType string,
-) (InboxEvent, error) {
-	res, err := r.Inbox().
-		FilterKey(key).
-		FilterTopic(topic).
-		FilterEventType(eventType).
-		Get(ctx)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return InboxEvent{}, nil
-	case err != nil:
-		return InboxEvent{}, err
-	}
-
-	return pgdbInboxEvent(res), nil
-}
-
-func (r *Repository) GetPendingInboxEvents(
-	ctx context.Context,
-	limit uint,
+	ids []uuid.UUID,
 ) ([]InboxEvent, error) {
-	rows, err := r.Inbox().New().
-		FilterStatus(InboxEventStatusPending).
-		Page(limit, 0).
-		Select(ctx)
+	res, err := b.queries.MarkInboxEventsAsProcessed(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mark inbox events as processed: %w", err)
 	}
 
-	events := make([]InboxEvent, len(rows))
-	for i, e := range rows {
-		events[i] = pgdbInboxEvent(e)
+	events := make([]InboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbInboxEvent(e))
 	}
 
 	return events, nil
 }
 
-func (r *Repository) DelayInboxEvents(
+func (b *Box) MarkInboxEventsAsFailed(
+	ctx context.Context,
+	ids []uuid.UUID,
+) ([]InboxEvent, error) {
+	res, err := b.queries.MarkInboxEventsAsFailed(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("mark inbox events as failed: %w", err)
+	}
+
+	events := make([]InboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbInboxEvent(e))
+	}
+
+	return events, nil
+}
+
+func (b *Box) DelayInboxEvents(
 	ctx context.Context,
 	ids []uuid.UUID,
 	delay time.Duration,
-) error {
-	_, err := r.Inbox().FilterID(ids...).AddAttempts().UpdateNextRetryAt(sql.NullTime{
-		Time:  time.Now().UTC().Add(delay),
-		Valid: true,
-	}).UpdateOne(ctx)
-	return err
-}
+) ([]InboxEvent, error) {
+	res, err := b.queries.DelayInboxEventsRetry(ctx, pgdb.DelayInboxEventsRetryParams{
+		Ids:         ids,
+		NextRetryAt: time.Now().UTC().Add(delay),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("delay inbox events: %w", err)
+	}
 
-func (r *Repository) MarkInboxEventsAsProcessed(
-	ctx context.Context,
-	ids []uuid.UUID,
-) error {
-	_, err := r.Inbox().FilterID(ids...).AddAttempts().UpdateStatus(InboxEventStatusProcessed).UpdateOne(ctx)
-	return err
-}
+	events := make([]InboxEvent, 0, len(res))
+	for _, e := range res {
+		events = append(events, pgdbInboxEvent(e))
+	}
 
-func (r *Repository) MarkInboxEventsAsFailed(
-	ctx context.Context,
-	ids []uuid.UUID,
-) error {
-	_, err := r.Inbox().FilterID(ids...).AddAttempts().UpdateStatus(InboxEventStatusFailed).UpdateOne(ctx)
-	return err
+	return events, nil
 }
 
 func pgdbInboxEvent(e pgdb.InboxEvent) InboxEvent {
 	res := InboxEvent{
-		ID:           e.ID,
-		Topic:        e.Topic,
-		EventType:    e.EventType,
-		EventVersion: e.EventVersion,
-		Key:          e.Key,
-		Payload:      e.Payload,
-		Status:       e.Status,
-		Attempts:     e.Attempts,
-		CreatedAt:    e.CreatedAt,
+		ID:        e.ID,
+		Topic:     e.Topic,
+		Key:       e.Key,
+		Type:      e.Type,
+		Version:   e.Version,
+		Producer:  e.Producer,
+		Payload:   e.Payload,
+		Status:    string(e.Status),
+		Attempts:  e.Attempts,
+		CreatedAt: e.CreatedAt,
 	}
 	if e.NextRetryAt.Valid {
 		res.NextRetryAt = &e.NextRetryAt.Time
