@@ -4,12 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/chains-lab/kafkakit/box/pgdb"
+	"github.com/chains-lab/kafkakit/header"
 	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 )
@@ -42,23 +42,23 @@ func (e OutboxEvent) ToMessage() kafka.Message {
 		Value: e.Payload,
 		Headers: []kafka.Header{
 			{
-				Key:   "event_id",
+				Key:   header.EventID,
 				Value: []byte(e.ID.String()),
 			},
 			{
-				Key:   "event_type",
+				Key:   header.EventType,
 				Value: []byte(e.Type),
 			},
 			{
-				Key:   "event_version",
+				Key:   header.EventVersion,
 				Value: []byte(strconv.FormatInt(int64(e.Version), 10)),
 			},
 			{
-				Key:   "producer",
+				Key:   header.Producer,
 				Value: []byte(e.Producer),
 			},
 			{
-				Key:   "content_type",
+				Key:   header.ContentType,
 				Value: []byte("application/json"),
 			},
 		},
@@ -83,33 +83,33 @@ func (b Box) CreateOutboxEvent(
 		headers[h.Key] = h.Value
 	}
 
-	eventIDByte, ok := headers["event_id"]
+	eventIDByte, ok := headers[header.EventID]
 	if !ok {
-		return OutboxEvent{}, errors.New("missing event_id header")
+		return OutboxEvent{}, fmt.Errorf("missing %s header", header.EventID)
 	}
 	eventID, err := uuid.ParseBytes(eventIDByte)
 	if err != nil {
-		return OutboxEvent{}, errors.New("invalid event_id header")
+		return OutboxEvent{}, fmt.Errorf("invalid %s header", header.EventID)
 	}
 
-	eventType, ok := headers["event_type"]
+	eventType, ok := headers[header.EventType]
 	if !ok {
-		return OutboxEvent{}, errors.New("missing event_type header")
+		return OutboxEvent{}, fmt.Errorf("missing %s header", header.EventType)
 	}
 
-	eventVersionBytes, ok := headers["event_version"]
+	eventVersionBytes, ok := headers[header.EventVersion]
 	if !ok {
-		return OutboxEvent{}, errors.New("missing event_version header")
+		return OutboxEvent{}, fmt.Errorf("missing %s header", header.EventVersion)
 	}
 
-	producer, ok := headers["producer"]
+	producer, ok := headers[header.Producer]
 	if !ok {
-		return OutboxEvent{}, errors.New("missing producer header")
+		return OutboxEvent{}, fmt.Errorf("missing %s header", header.Producer)
 	}
 
 	var eventVersion int32
-	if err := json.Unmarshal(eventVersionBytes, &eventVersion); err != nil {
-		return OutboxEvent{}, errors.New("invalid event_version header")
+	if err = json.Unmarshal(eventVersionBytes, &eventVersion); err != nil {
+		return OutboxEvent{}, fmt.Errorf("invalid %s header", header.EventVersion)
 	}
 
 	stmt := pgdb.CreateOutboxEventParams{
